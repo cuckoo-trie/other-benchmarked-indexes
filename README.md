@@ -20,7 +20,7 @@ An example commandline using the [jemalloc](http://jemalloc.net) allocator to ru
 numactl --interleave=all -C 0 env LD_PRELOAD=path/to/libjemalloc.so MALLOC_CONF=thp:always ./test_wormhole insert rand-8
 ```
 
-Note that `jemalloc` relies on the Transparent Huge Pages (THP) mechanism in Linux to allocate huge pages, and THP silently falls back to regular pages if no huge pages are available. Check that the counter `thp_fault_fallback` in `/proc/vmstat` is not incremented when running the benchmark to rule out this possibility.
+**Note**: `jemalloc` relies on the Transparent Huge Pages (THP) mechanism in Linux to allocate huge pages, and THP silently falls back to regular pages if no huge pages are available. Check that the counter `thp_fault_fallback` in `/proc/vmstat` is not incremented when running the benchmark to rule out this possibility.
 
 ## Benchmarking individual indexes
 
@@ -154,6 +154,6 @@ numactl --interleave=all -C 0 env JE_MALLOC_CONF=thp:always ./redis-server path/
 
 This instructs the `jemalloc` allocator embedded inside Redis to use huge pages. 
 
-Note that `jemalloc` relies on the Transparent Huge Pages (THP) mechanism in Linux to allocate huge pages, and THP silently falls back to regular pages if no huge pages are available. Check that the counter `thp_fault_fallback` in `/proc/vmstat` is not incremented when running the benchmark to rule out this possibility.
+**Note**: `jemalloc` relies on the Transparent Huge Pages (THP) mechanism in Linux to allocate huge pages, and THP silently falls back to regular pages if no huge pages are available. Check that the counter `thp_fault_fallback` in `/proc/vmstat` is not incremented when running the benchmark to rule out this possibility.
 
 [^1]: The Redis developers decided not to use huge pages because it slows down the saving of the database to disk. This is not a problem when benchmarking Redis as an in-memory database, with saving to the disk disabled.
