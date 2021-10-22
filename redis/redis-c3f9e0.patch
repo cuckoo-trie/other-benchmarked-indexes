@@ -1,0 +1,692 @@
+diff --git a/src/Makefile b/src/Makefile
+index daa201d73..a528a222d 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -85,9 +85,17 @@ endif
+ 
+ FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(REDIS_CFLAGS)
+ FINAL_LDFLAGS=$(LDFLAGS) $(REDIS_LDFLAGS) $(DEBUG)
+-FINAL_LIBS=-lm
++FINAL_LIBS=-lm ../../../cuckoo_trie/cuckoo_trie/libcuckoo_trie.so ../../../other_benchmarked_indexes/wormhole/wormhole/libwh.so
++FINAL_LIBS+=../../../other_benchmarked_indexes/hot/hot_for_redis.so
++FINAL_LIBS+=../../../other_benchmarked_indexes/artolc/artolc_for_redis.so
++FINAL_LIBS+=../../../other_benchmarked_indexes/stx/stx_for_redis.so
+ DEBUG=-g -ggdb
+ 
++FINAL_CFLAGS+=-I../../../cuckoo_trie/cuckoo_trie -I../../../other_benchmarked_indexes/wormhole/wormhole
++FINAL_CFLAGS+=-I../../../other_benchmarked_indexes/hot
++FINAL_CFLAGS+=-I../../../other_benchmarked_indexes/artolc
++FINAL_CFLAGS+=-I../../../other_benchmarked_indexes/stx
++
+ # Linux ARM needs -latomic at linking time
+ ifneq (,$(filter aarch64 armv,$(uname_M)))
+         FINAL_LIBS+=-latomic
+diff --git a/src/config.c b/src/config.c
+old mode 100644
+new mode 100755
+index 3d5a79eab..dbd64ec9a
+--- a/src/config.c
++++ b/src/config.c
+@@ -104,6 +104,17 @@ configEnum tls_auth_clients_enum[] = {
+     {"optional", TLS_CLIENT_AUTH_OPTIONAL},
+     {NULL, 0}
+ };
++
++configEnum zset_impl_enum[] = {
++    {"default", ZSET_IMPL_DEFAULT},
++    {"cuckoo-trie", ZSET_IMPL_CUCKOO_TRIE},
++    {"wormhole", ZSET_IMPL_WORMHOLE},
++    {"hot", ZSET_IMPL_HOT},
++    {"artolc", ZSET_IMPL_ARTOLC},
++    {"stx", ZSET_IMPL_STX},
++    {NULL, 0}
++};
++
+ /* Output buffer limits presets. */
+ clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
+     {0, 0, 0}, /* normal */
+@@ -2319,6 +2330,7 @@ standardConfig configs[] = {
+     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
+     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
+     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, NULL),
++    createEnumConfig("zset-impl", NULL, MODIFIABLE_CONFIG, zset_impl_enum, server.zset_impl, ZSET_IMPL_DEFAULT, NULL, NULL),
+ 
+     /* Integer configs */
+     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
+@@ -2373,6 +2385,7 @@ standardConfig configs[] = {
+ 
+     /* Unsigned Long Long configs */
+     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
++    createULongLongConfig("ct-default-size", NULL, MODIFIABLE_CONFIG, 1000, ULLONG_MAX, server.ct_default_size, 1000000, MEMORY_CONFIG, NULL, NULL),
+ 
+     /* Size_t configs */
+     createSizeTConfig("hash-max-ziplist-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_ziplist_entries, 512, INTEGER_CONFIG, NULL, NULL),
+diff --git a/src/object.c b/src/object.c
+old mode 100644
+new mode 100755
+index 1b8852f18..07766ae84
+--- a/src/object.c
++++ b/src/object.c
+@@ -28,7 +28,14 @@
+  * POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++
+ #include "server.h"
++#include "cuckoo_trie.h"
++#include "lib.h"
++#include "mini_wh.h"
++#include "hot_for_redis.h"
++#include "artolc_for_redis.h"
++#include "stx_for_redis.h"
+ #include <math.h>
+ #include <ctype.h>
+ 
+@@ -257,6 +264,56 @@ robj *createZsetObject(void) {
+     return o;
+ }
+ 
++robj *createCuckooTrieZsetObject(void) {
++    cuckoo_trie* trie = ct_alloc(server.ct_default_size);
++
++    robj *o = createObject(OBJ_ZSET, trie);
++    o->encoding = OBJ_ENCODING_CUCKOO_TRIE;
++    return o;
++}
++
++const struct kvmap_mm mm_dont_copy_kv = {
++    .in = kvmap_mm_in_noop,
++    .out = kvmap_mm_out_noop,
++    .free = kvmap_mm_free_noop,
++    .priv = NULL,
++};
++
++robj *createWormholeZsetObject(void) {
++    /* We allocate a new `struct kv` for each key inserted in zsetAdd. Use mm_dont_copy_kv
++     * to avoid wormhole creating another copy of the kv (and leaking the one we created).
++     */
++    struct wormhole* wormhole = whunsafe_create(&mm_dont_copy_kv);
++
++    robj *o = createObject(OBJ_ZSET, wormhole);
++    o->encoding = OBJ_ENCODING_WORMHOLE;
++    return o;
++}
++
++robj *createHotZsetObject(void) {
++    void* trie = hot_create();
++
++    robj *o = createObject(OBJ_ZSET, trie);
++    o->encoding = OBJ_ENCODING_HOT;
++    return o;
++}
++
++robj *createArtolcZsetObject(void) {
++    void* trie = artolc_create();
++
++    robj *o = createObject(OBJ_ZSET, trie);
++    o->encoding = OBJ_ENCODING_ARTOLC;
++    return o;
++}
++
++robj* createStxZsetObject(void) {
++    void* tree = stx_create();
++
++    robj* o = createObject(OBJ_ZSET, tree);
++    o->encoding = OBJ_ENCODING_STX;
++    return o;
++}
++
+ robj *createZsetZiplistObject(void) {
+     unsigned char *zl = ziplistNew();
+     robj *o = createObject(OBJ_ZSET,zl);
+@@ -317,6 +374,26 @@ void freeZsetObject(robj *o) {
+     case OBJ_ENCODING_ZIPLIST:
+         zfree(o->ptr);
+         break;
++    case OBJ_ENCODING_CUCKOO_TRIE:
++        printf("Warning: Freeing Cuckoo-Trie. Keys are leaked\n");
++        ct_free(o->ptr);
++        break;
++    case OBJ_ENCODING_WORMHOLE:
++        printf("Warning: Freeing Wormhole. Keys are leaked\n");
++        ct_free(o->ptr);
++        break;
++    case OBJ_ENCODING_HOT:
++        printf("Warning: Freeing HOT. Keys are leaked\n");
++        hot_free(o->ptr);
++        break;
++    case OBJ_ENCODING_ARTOLC:
++        printf("Warning: Freeing ARTOLC. Keys are leaked\n");
++        artolc_free(o->ptr);
++        break;
++    case OBJ_ENCODING_STX:
++        printf("Warning: Freeing STX. Keys are leaked\n");
++        stx_free(o->ptr);
++        break;
+     default:
+         serverPanic("Unknown sorted set encoding");
+     }
+diff --git a/src/server.h b/src/server.h
+old mode 100644
+new mode 100755
+index 8ddc0b75f..722b045ef
+--- a/src/server.h
++++ b/src/server.h
+@@ -448,6 +448,13 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
+ /* Get the first bind addr or NULL */
+ #define NET_FIRST_BIND_ADDR (server.bindaddr_count ? server.bindaddr[0] : NULL)
+ 
++#define ZSET_IMPL_DEFAULT 0
++#define ZSET_IMPL_CUCKOO_TRIE 1
++#define ZSET_IMPL_WORMHOLE 2
++#define ZSET_IMPL_HOT 3
++#define ZSET_IMPL_ARTOLC 4
++#define ZSET_IMPL_STX 5
++
+ /* Using the following macro you can run code inside serverCron() with the
+  * specified period, specified in milliseconds.
+  * The actual resolution depends on server.hz. */
+@@ -614,6 +621,11 @@ typedef struct RedisModuleDigest {
+ #define OBJ_ENCODING_EMBSTR 8  /* Embedded sds string encoding */
+ #define OBJ_ENCODING_QUICKLIST 9 /* Encoded as linked list of ziplists */
+ #define OBJ_ENCODING_STREAM 10 /* Encoded as a radix tree of listpacks */
++#define OBJ_ENCODING_CUCKOO_TRIE 11
++#define OBJ_ENCODING_WORMHOLE 12
++#define OBJ_ENCODING_HOT 13
++#define OBJ_ENCODING_ARTOLC 14
++#define OBJ_ENCODING_STX 15
+ 
+ #define LRU_BITS 24
+ #define LRU_CLOCK_MAX ((1<<LRU_BITS)-1) /* Max value of obj->lru */
+@@ -1490,6 +1502,10 @@ struct redisServer {
+     char *bio_cpulist; /* cpu affinity list of bio thread. */
+     char *aof_rewrite_cpulist; /* cpu affinity list of aof rewrite process. */
+     char *bgsave_cpulist; /* cpu affinity list of bgsave process. */
++
++    /* Cuckoo Trie */
++    int zset_impl;
++    unsigned long long ct_default_size;
+ };
+ 
+ typedef struct pubsubPattern {
+@@ -1817,6 +1833,11 @@ robj *createSetObject(void);
+ robj *createIntsetObject(void);
+ robj *createHashObject(void);
+ robj *createZsetObject(void);
++robj *createCuckooTrieZsetObject(void);
++robj *createWormholeZsetObject(void);
++robj *createHotZsetObject(void);
++robj *createArtolcZsetObject(void);
++robj *createStxZsetObject(void);
+ robj *createZsetZiplistObject(void);
+ robj *createStreamObject(void);
+ robj *createModuleObject(moduleType *mt, void *value);
+@@ -2240,6 +2261,12 @@ void removeClientFromTimeoutTable(client *c);
+ void handleBlockedClientsTimeout(void);
+ int clientsCronHandleTimeout(client *c, mstime_t now_ms);
+ 
++/* timeout.c -- Blocked clients timeout and connections timeout. */
++void addClientToTimeoutTable(client *c);
++void removeClientFromTimeoutTable(client *c);
++void handleBlockedClientsTimeout(void);
++int clientsCronHandleTimeout(client *c, mstime_t now_ms);
++
+ /* expire.c -- Handling of expired keys */
+ void activeExpireCycle(int type);
+ void expireSlaveKeys(void);
+diff --git a/src/t_zset.c b/src/t_zset.c
+old mode 100644
+new mode 100755
+index 5fc7643c3..f1ec7b749
+--- a/src/t_zset.c
++++ b/src/t_zset.c
+@@ -56,7 +56,14 @@
+  * pointers being only at "level 1". This allows to traverse the list
+  * from tail to head, useful for ZREVRANGE. */
+ 
++
+ #include "server.h"
++#include "cuckoo_trie.h"
++#include "lib.h"
++#include "mini_wh.h"
++#include "hot_for_redis.h"
++#include "artolc_for_redis.h"
++#include "stx_for_redis.h"
+ #include <math.h>
+ 
+ /*-----------------------------------------------------------------------------
+@@ -1263,6 +1270,50 @@ int zsetScore(robj *zobj, sds member, double *score) {
+         dictEntry *de = dictFind(zs->dict, member);
+         if (de == NULL) return C_ERR;
+         *score = *(double*)dictGetVal(de);
++    } else if (zobj->encoding == OBJ_ENCODING_CUCKOO_TRIE) {
++        cuckoo_trie* trie = zobj->ptr;
++
++        ct_kv* result = ct_lookup(trie, sdslen(member), member);
++        if (!result)
++            return C_ERR;
++
++        *score = *((double*)kv_value_bytes(result));
++    } else if (zobj->encoding == OBJ_ENCODING_WORMHOLE) {
++        struct wormhole * wormhole = zobj->ptr;
++
++        struct kref member_kref;
++        member_kref.len = sdslen(member);
++        member_kref.ptr = member;
++        kref_update_hash32(&member_kref);
++        struct kv* result = whunsafe_get(wormhole, &member_kref, NULL);
++        if (!result)
++            return C_ERR;
++
++        *score = *((double*)kv_vptr(result));
++    } else if (zobj->encoding == OBJ_ENCODING_HOT) {
++        void* trie = zobj->ptr;
++
++        const redis_string_kv* result = hot_lookup(trie, member);
++        if (!result)
++            return C_ERR;
++
++        *score = result->value;
++    } else if (zobj->encoding == OBJ_ENCODING_ARTOLC) {
++        void* trie = zobj->ptr;
++
++        redis_string_kv_with_len* result = artolc_lookup(trie, member, sdslen(member) + 1);
++        if (!result)
++            return C_ERR;
++
++        *score = result->value;
++    } else if (zobj->encoding == OBJ_ENCODING_STX) {
++        void* tree = zobj->ptr;
++
++        stx_kv_t* result = stx_lookup(tree, member);
++        if (!result)
++            return C_ERR;
++
++        *score = result->value;
+     } else {
+         serverPanic("Unknown sorted set encoding");
+     }
+@@ -1283,9 +1334,9 @@ int zsetScore(robj *zobj, sds member, double *score) {
+  *            assume 0 as previous score.
+  * ZADD_NX:   Perform the operation only if the element does not exist.
+  * ZADD_XX:   Perform the operation only if the element already exist.
+- * ZADD_GT:   Perform the operation on existing elements only if the new score is 
++ * ZADD_GT:   Perform the operation on existing elements only if the new score is
+  *            greater than the current score.
+- * ZADD_LT:   Perform the operation on existing elements only if the new score is 
++ * ZADD_LT:   Perform the operation on existing elements only if the new score is
+  *            less than the current score.
+  *
+  * When ZADD_INCR is used, the new score of the element is stored in
+@@ -1354,11 +1405,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
+             }
+ 
+             /* Remove and re-insert when score changed. */
+-            if (score != curscore &&  
++            if (score != curscore &&
+                 /* LT? Only update if score is less than current. */
+                 (!lt || score < curscore) &&
+                 /* GT? Only update if score is greater than current. */
+-                (!gt || score > curscore)) 
++                (!gt || score > curscore))
+             {
+                 zobj->ptr = zzlDelete(zobj->ptr,eptr);
+                 zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+@@ -1404,11 +1455,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
+             }
+ 
+             /* Remove and re-insert when score changes. */
+-            if (score != curscore &&  
++            if (score != curscore &&
+                 /* LT? Only update if score is less than current. */
+                 (!lt || score < curscore) &&
+                 /* GT? Only update if score is greater than current. */
+-                (!gt || score > curscore)) 
++                (!gt || score > curscore))
+             {
+                 znode = zslUpdateScore(zs->zsl,curscore,ele,score);
+                 /* Note that we did not removed the original element from
+@@ -1429,6 +1480,92 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
+             *flags |= ZADD_NOP;
+             return 1;
+         }
++    } else if (zobj->encoding == OBJ_ENCODING_CUCKOO_TRIE) {
++        cuckoo_trie* trie = zobj->ptr;
++
++        if (nx || xx)
++            serverPanic("Cuckoo-Trie ZSET doesn't support NX/XX");
++
++        // Create the kv to insert
++        ct_kv* kv = zmalloc(kv_required_size(sdslen(ele), sizeof(score)));
++        kv_init(kv, sdslen(ele), 0);
++        memcpy(kv->bytes, ele, sdslen(ele));
++        *((double*)kv_value_bytes(kv)) = score;
++
++        int result = ct_insert(trie, kv);
++        if (result == S_OK)
++            *flags |= ZADD_ADDED;
++        else if (result != S_ALREADYIN)
++            serverPanic("Cuckoo-Trie insertion error");
++
++        return 1;
++    } else if (zobj->encoding == OBJ_ENCODING_WORMHOLE) {
++        struct wormhole* wormhole = zobj->ptr;
++
++        if (nx || xx)
++            serverPanic("Wormhole ZSET doesn't support NX/XX");
++
++        // Create the kv to insert
++        struct kv* wh_kv = zmalloc(sizeof(struct kv) + sdslen(ele) + sizeof(score));
++        kv_refill(wh_kv, ele, sdslen(ele), &score, sizeof(score));
++
++        bool result = whunsafe_set(wormhole, wh_kv);
++        if (!result)
++            serverPanic("Wormhole insertion error");
++
++        // We don't know whether we added a new key or updated an existing one
++        // (whunsafe_set returns true in both cases). Assume that it was a new key.
++        *flags |= ZADD_ADDED;
++
++        return 1;
++    } else if (zobj->encoding == OBJ_ENCODING_HOT) {
++        void* trie = zobj->ptr;
++
++        if (nx || xx)
++            serverPanic("HOT ZSET doesn't support NX/XX");
++
++        redis_string_kv* kv = zmalloc(sizeof(redis_string_kv) + sdslen(ele) + 1);
++        kv->value = score;
++        memcpy(kv->key, ele, sdslen(ele) + 1);
++
++        int added = hot_upsert(trie, kv);
++        if (added)
++            *flags |= ZADD_ADDED;
++        return 1;
++    } else if (zobj->encoding == OBJ_ENCODING_ARTOLC) {
++        void* trie = zobj->ptr;
++
++        if (nx || xx)
++            serverPanic("ARTOLC ZSET doesn't support NX/XX");
++
++        redis_string_kv_with_len* kv = zmalloc(sizeof(redis_string_kv_with_len) + sdslen(ele) + 1);
++        kv->value = score;
++        kv->key_size = sdslen(ele) + 1;   // The key bytes passed to ARTOLC include the terminating NULL
++        memcpy(kv->key, ele, sdslen(ele) + 1);
++
++        artolc_insert(trie, kv);
++
++        // We don't know whether we added a new key or updated an existing one.
++        // Assume that it was a new key.
++        *flags |= ZADD_ADDED;
++
++        return 1;
++    } else if (zobj->encoding == OBJ_ENCODING_STX) {
++        void* tree = zobj->ptr;
++
++        if (nx || xx)
++            serverPanic("STX ZSET doesn't support NX/XX");
++
++        stx_kv_t* kv = zmalloc(sizeof(stx_kv_t) + sdslen(ele) + 1);
++        kv->value = score;
++        memcpy(kv->key, ele, sdslen(ele) + 1);
++
++        int inserted = stx_insert(tree, kv);
++
++        if (inserted)
++            *flags |= ZADD_ADDED;
++
++        return 1;
+     } else {
+         serverPanic("Unknown sorted set encoding");
+     }
+@@ -1600,7 +1737,7 @@ void zaddGenericCommand(client *c, int flags) {
+             "XX and NX options at the same time are not compatible");
+         return;
+     }
+-    
++
+     if ((gt && nx) || (lt && nx) || (gt && lt)) {
+         addReplyError(c,
+             "GT, LT, and/or NX options at the same time are not compatible");
+@@ -1628,7 +1765,17 @@ void zaddGenericCommand(client *c, int flags) {
+     if (checkType(c,zobj,OBJ_ZSET)) goto cleanup;
+     if (zobj == NULL) {
+         if (xx) goto reply_to_client; /* No key + XX option: nothing to do. */
+-        if (server.zset_max_ziplist_entries == 0 ||
++        if (server.zset_impl == ZSET_IMPL_CUCKOO_TRIE) {
++            zobj = createCuckooTrieZsetObject();
++        } else if (server.zset_impl == ZSET_IMPL_WORMHOLE) {
++            zobj = createWormholeZsetObject();
++        } else if (server.zset_impl == ZSET_IMPL_HOT) {
++            zobj = createHotZsetObject();
++        } else if (server.zset_impl == ZSET_IMPL_ARTOLC) {
++            zobj = createArtolcZsetObject();
++        } else if (server.zset_impl == ZSET_IMPL_STX) {
++            zobj = createStxZsetObject();
++        } else if (server.zset_max_ziplist_entries == 0 ||
+             server.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr))
+         {
+             zobj = createZsetObject();
+@@ -3103,6 +3250,222 @@ void genericZrangebylexCommand(client *c, int reverse) {
+                 ln = ln->level[0].forward;
+             }
+         }
++    } else if (zobj->encoding == OBJ_ENCODING_CUCKOO_TRIE) {
++        ct_kv* result;
++
++        if (reverse)
++            serverPanic("Cuckoo-Trie ZSET doesn't support reverse iteration");
++
++        if (range.min == shared.minstring)
++            serverPanic("Cuckoo-Trie ZSET doesn't support ranges starting from \"-\"");
++
++        if (range.minex || !range.maxex)
++            serverPanic("Cuckoo-Trie ZSET only supports inclusive-exclusive ranges");
++
++
++        cuckoo_trie* trie = zobj->ptr;
++        ct_iter* iter = ct_iter_alloc(trie);
++        ct_iter_goto(iter, sdslen(range.min), range.min);
++
++        result = ct_iter_next(iter);
++        if (!result) {
++            free(iter);
++            addReply(c,shared.emptyarray);
++            zslFreeLexRange(&range);
++            return;
++        }
++
++        replylen = addReplyDeferredLen(c);
++
++        while (result && offset--)
++            result = ct_iter_next(iter);
++
++        while (result && limit--) {
++            if (range.max != shared.maxstring) {
++                if (kv_key_compare_to(result, sdslen(range.max), range.max) >= 0)
++                    break;  //  <result> is beyond the range end
++            }
++
++            rangelen++;
++            addReplyBulkCBuffer(c, kv_key_bytes(result), kv_key_size(result));
++
++            result = ct_iter_next(iter);
++        }
++        free(iter);
++    } else if (zobj->encoding == OBJ_ENCODING_WORMHOLE) {
++        struct wormhole * wormhole = zobj->ptr;
++        struct wormhole_iter * iter;
++        struct kv * kv;
++        struct kref start;
++
++        if (reverse)
++            serverPanic("Wormhole ZSET doesn't support reverse iteration");
++
++        if (range.min == shared.minstring)
++            serverPanic("Wormhole ZSET doesn't support ranges starting from \"-\"");
++
++        if (range.minex || !range.maxex)
++            serverPanic("Wormhole ZSET only supports inclusive-exclusive ranges");
++
++
++        iter = whunsafe_iter_create(wormhole);
++        start.len = sdslen(range.min);
++        start.ptr = range.min;
++        kref_update_hash32(&start);
++        whunsafe_iter_seek(iter, &start);
++
++        kv = whunsafe_iter_next(iter, NULL);
++        if (!kv) {
++            whunsafe_iter_destroy(iter);
++            addReply(c,shared.emptyarray);
++            zslFreeLexRange(&range);
++            return;
++        }
++
++        replylen = addReplyDeferredLen(c);
++
++        while (kv && offset--)
++            kv = whunsafe_iter_next(iter, NULL);
++
++        while (kv && limit--) {
++            if (range.max != shared.maxstring) {
++                int min_len;
++                if (sdslen(range.max) < kv->klen)
++                    min_len = sdslen(range.max);
++                else
++                    min_len = kv->klen;
++
++                int cmp = memcmp(range.max, kv->kv, min_len);
++                if (cmp < 0 || (cmp == 0 && sdslen(range.max) <= kv->klen)) {
++                    break;
++                }
++            }
++
++            rangelen++;
++            addReplyBulkCBuffer(c, kv->kv, kv->klen);
++
++            kv = whunsafe_iter_next(iter, NULL);
++        }
++        whunsafe_iter_destroy(iter);
++    } else if (zobj->encoding == OBJ_ENCODING_HOT) {
++        void* trie = zobj->ptr;
++        void* iter;
++        const redis_string_kv* kv;
++
++        if (reverse)
++            serverPanic("HOT ZSET doesn't support reverse iteration");
++
++        if (range.min == shared.minstring)
++            serverPanic("HOT ZSET doesn't support ranges starting from \"-\"");
++
++        if (range.minex || !range.maxex)
++            serverPanic("HOT ZSET only supports inclusive-exclusive ranges");
++
++        iter = hot_iter_create(trie, range.min);
++
++        kv = hot_iter_next(iter);
++        if (!kv) {
++            hot_iter_free(iter);
++            addReply(c,shared.emptyarray);
++            zslFreeLexRange(&range);
++            return;
++        }
++
++        replylen = addReplyDeferredLen(c);
++
++        while (kv && offset--)
++            kv = hot_iter_next(iter);
++
++        while (kv && limit--) {
++            if (range.max != shared.maxstring) {
++                if (strcmp(range.max, kv->key) <= 0)
++                    break;
++            }
++
++            rangelen++;
++            addReplyBulkCBuffer(c, kv->key, strlen(kv->key));
++
++            kv = hot_iter_next(iter);
++        }
++
++        hot_iter_free(iter);
++    } else if (zobj->encoding == OBJ_ENCODING_ARTOLC) {
++        uint64_t i;
++        void* trie = zobj->ptr;
++        redis_string_kv_with_len** results;
++
++        if (reverse)
++            serverPanic("ARTOLC ZSET doesn't support reverse iteration");
++
++        if (offset)
++            serverPanic("ARTOLC ZSET doesn't support range iteration with offset");
++
++        if (range.min == shared.minstring)
++            serverPanic("ARTOLC ZSET doesn't support ranges starting from \"-\"");
++
++        if (range.minex || !range.maxex)
++            serverPanic("ARTOLC ZSET only supports inclusive-exclusive ranges");
++
++        results = zmalloc(sizeof(redis_string_kv_with_len*) * limit);
++        rangelen = artolc_range_from(trie, range.min, sdslen(range.min), limit, results);
++
++        if (!rangelen) {
++            zfree(results);
++            addReply(c,shared.emptyarray);
++            zslFreeLexRange(&range);
++            return;
++        }
++        replylen = addReplyDeferredLen(c);
++
++        for (i = 0; i < rangelen; i++) {
++            redis_string_kv_with_len* kv = results[i];
++
++            // Don't return the NULL terminator that we add to the user
++            addReplyBulkCBuffer(c, kv->key, kv->key_size - 1);
++        }
++        zfree(results);
++    } else if (zobj->encoding == OBJ_ENCODING_STX) {
++        void* tree = zobj->ptr;
++        void* iter;
++        stx_kv_t* kv;
++
++        if (reverse)
++            serverPanic("STX ZSET doesn't support reverse iteration");
++
++        if (range.min == shared.minstring)
++            serverPanic("STX ZSET doesn't support ranges starting from \"-\"");
++
++        if (range.minex || !range.maxex)
++            serverPanic("STX ZSET only supports inclusive-exclusive ranges");
++
++        iter = stx_iter_create();
++        stx_iter_goto(tree, iter, range.min);
++
++        kv = stx_iter_next(tree, iter);
++        if (!kv) {
++            stx_iter_free(iter);
++            addReply(c,shared.emptyarray);
++            zslFreeLexRange(&range);
++            return;
++        }
++        replylen = addReplyDeferredLen(c);
++
++        while (kv && offset--)
++            kv = stx_iter_next(tree, iter);
++
++        while (kv && limit--) {
++            if (range.max != shared.maxstring) {
++                if (strcmp(range.max, kv->key) <= 0)
++                    break;
++            }
++
++            rangelen++;
++            addReplyBulkCBuffer(c, kv->key, strlen(kv->key));
++
++            kv = stx_iter_next(tree, iter);
++        }
++
++        stx_iter_free(iter);
+     } else {
+         serverPanic("Unknown sorted set encoding");
+     }
