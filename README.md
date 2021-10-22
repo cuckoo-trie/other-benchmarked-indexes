@@ -1,6 +1,6 @@
 # Indexes used for Cuckoo Trie benchmarks
 
-This repository contains the code for the indexes the Cuckoo Trie was compared to in Cuckoo Trie: Exploiting Memory-Level Parallelism for Efficient DRAM Indexing. The code for the Cuckoo Trie index itself is [here](https://github.com/cuckoo-trie/cuckoo-trie-code)
+This repository contains the code for the indexes the Cuckoo Trie was compared to in Cuckoo Trie: Exploiting Memory-Level Parallelism for Efficient DRAM Indexing. The code for the Cuckoo Trie index itself is [here](https://github.com/cuckoo-trie/cuckoo-trie-code).
 
 The indexes included are: [HOT](https://github.com/speedskater/hot), [Wormhole](https://github.com/wuxb45/wormhole), [ARTOLC](https://github.com/wangziqi2016/index-microbench/tree/master/ARTOLC), [STX](https://github.com/tlx/tlx/tree/master/tlx/container) and [MlpIndex](https://github.com/sillycross/mlpds). For each index the repository contains:
 - The version of the index used in the paper.
